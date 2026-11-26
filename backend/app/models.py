@@ -14,10 +14,13 @@ from sqlalchemy import (
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 from .enums import (
+    InviteStatus,
     MaintenanceKind,
+    MatchPolicy,
     ReservationMode,
     ReservationStatus,
     ServiceActionKind,
+    WaitlistStatus,
 )
 
 
@@ -43,8 +46,15 @@ class Site(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str] = mapped_column(String(64))
     location: Mapped[str] = mapped_column(String(128))
+    # 候补空档的分配规则：严格先后（FIFO）或兼容优先（COMPATIBILITY）
+    match_policy: Mapped[MatchPolicy] = mapped_column(
+        Enum(MatchPolicy), default=MatchPolicy.FIFO
+    )
 
     connectors: Mapped[list["Connector"]] = relationship(
+        back_populates="site", cascade="all, delete-orphan"
+    )
+    waitlist_requests: Mapped[list["WaitlistRequest"]] = relationship(
         back_populates="site", cascade="all, delete-orphan"
     )
 
@@ -184,3 +194,98 @@ class IdempotencyRecord(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime, default=lambda: datetime.now()
     )
+
+
+# ---------- 候补 ----------
+
+class WaitlistRequest(Base):
+    """候补请求：司机在目标站点排队，等待取消释放出来的空档。
+
+    约束快照：车辆接口取自 vehicle，最低功率/所需时长/到站期限/可接受替代站点
+    均在登记时固化；匹配只能向“车辆能力匹配且能覆盖完整时长”的请求发邀请，
+    邀请本身不是预约，接受并通过容量校验后才生成 CONFIRMED 预约。
+    """
+
+    __tablename__ = "waitlist_requests"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    ref: Mapped[str] = mapped_column(String(32), unique=True)
+    vehicle_id: Mapped[int] = mapped_column(ForeignKey("vehicles.id"))
+    site_id: Mapped[int] = mapped_column(ForeignKey("sites.id"))
+    status: Mapped[WaitlistStatus] = mapped_column(
+        Enum(WaitlistStatus), default=WaitlistStatus.QUEUED
+    )
+    min_power_kw: Mapped[float] = mapped_column(Numeric(6, 2))
+    duration_minutes: Mapped[int] = mapped_column(Integer)
+    # 到站期限：只接受 start_at 不晚于该时刻的空档
+    arrive_by: Mapped[datetime] = mapped_column(DateTime)
+    # 可接受的替代站点 id 列表（JSON 文本）；为空表示只接受登记站点
+    acceptable_site_ids: Mapped[str] = mapped_column(Text, default="[]")
+    # 登记即排队顺序的权威依据；id 作为同刻次序的平局判定
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=lambda: datetime.now(), onupdate=lambda: datetime.now()
+    )
+    # 接受邀请后生成的预约；邀请/拒绝/超时阶段不产生预约
+    reservation_id: Mapped[int | None] = mapped_column(
+        ForeignKey("reservations.id"), nullable=True
+    )
+
+    vehicle: Mapped[Vehicle] = relationship(foreign_keys=[vehicle_id])
+    site: Mapped[Site] = relationship(back_populates="waitlist_requests", foreign_keys=[site_id])
+    reservation: Mapped["Reservation | None"] = relationship(foreign_keys=[reservation_id])
+    invites: Mapped[list["WaitlistInvite"]] = relationship(
+        back_populates="waitlist_request",
+        cascade="all, delete-orphan",
+        order_by="WaitlistInvite.id",
+    )
+    events: Mapped[list["WaitlistEvent"]] = relationship(
+        back_populates="waitlist_request",
+        cascade="all, delete-orphan",
+        order_by="WaitlistEvent.id",
+    )
+
+
+class WaitlistInvite(Base):
+    """一次性空档邀请：有明确截止时刻，过期/拒绝/被取代均留痕，绝不等于预约。"""
+
+    __tablename__ = "waitlist_invites"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    waitlist_request_id: Mapped[int] = mapped_column(ForeignKey("waitlist_requests.id"))
+    site_id: Mapped[int] = mapped_column(ForeignKey("sites.id"))
+    status: Mapped[InviteStatus] = mapped_column(
+        Enum(InviteStatus), default=InviteStatus.PENDING
+    )
+    # 邀请的具体空档与枪口（固定枪口承诺，接受时再次做容量校验）
+    connector_id: Mapped[int] = mapped_column(ForeignKey("connectors.id"))
+    slot_start: Mapped[datetime] = mapped_column(DateTime)
+    slot_end: Mapped[datetime] = mapped_column(DateTime)
+    offered_power_kw: Mapped[float] = mapped_column(Numeric(6, 2))
+    # 截止时刻：仅 PENDING 且 now <= expires_at 可以接受
+    expires_at: Mapped[datetime] = mapped_column(DateTime)
+    # 触发本次邀请的取消预约，便于审计“空档从哪里来”
+    source_reservation_id: Mapped[int | None] = mapped_column(
+        ForeignKey("reservations.id"), nullable=True
+    )
+    responded_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now())
+
+    waitlist_request: Mapped[WaitlistRequest] = relationship(back_populates="invites")
+    connector: Mapped["Connector"] = relationship(foreign_keys=[connector_id])
+
+
+class WaitlistEvent(Base):
+    """候补生命周期事件流：登记/邀请/接受/拒绝/超时/保留/关闭全部可解释。"""
+
+    __tablename__ = "waitlist_events"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    waitlist_request_id: Mapped[int] = mapped_column(ForeignKey("waitlist_requests.id"))
+    event_type: Mapped[str] = mapped_column(String(48))
+    detail: Mapped[str] = mapped_column(Text, default="{}")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=lambda: datetime.now()
+    )
+
+    waitlist_request: Mapped[WaitlistRequest] = relationship(back_populates="events")

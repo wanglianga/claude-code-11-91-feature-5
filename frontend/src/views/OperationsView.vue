@@ -180,17 +180,98 @@
           </tbody>
         </table>
       </div>
+
+      <div class="panel">
+        <h2>⑥ 候补空档分配规则</h2>
+        <div class="row">
+          <label class="field">
+            <span>站点</span>
+            <select v-model="policy.site_id" @change="onPolicySite">
+              <option v-for="s in sites" :key="s.id" :value="s.id">{{ s.name }}</option>
+            </select>
+          </label>
+          <label class="field">
+            <span>规则</span>
+            <select v-model="policy.match_policy">
+              <option value="FIFO">严格先后（FIFO，公平易解释）</option>
+              <option value="COMPATIBILITY">兼容优先（稀缺能力优先，提高利用率）</option>
+            </select>
+          </label>
+        </div>
+        <button @click="savePolicy">保存规则</button>
+        <button class="secondary" @click="runSweep">立即巡检超时</button>
+        <p class="muted">
+          两条规则都只向「能力匹配且能覆盖完整时长、不晚于到站期限」的候补发邀请；
+          巡检会把过截止时刻的邀请置超时、把超到站期限的候补关闭，全部写事件流。
+        </p>
+      </div>
+
+      <div class="panel">
+        <h2>⑦ 候补队列（按登记顺位）</h2>
+        <table v-if="waitlist.length">
+          <thead><tr><th>候补号</th><th>登记时间</th><th>车辆/需求</th><th>站点/替代</th><th>到站期限</th><th>状态</th><th>事件</th></tr></thead>
+          <tbody>
+            <tr v-for="w in waitlist" :key="w.id">
+              <td class="mono">{{ w.ref }}</td>
+              <td class="mono">{{ fmt(w.created_at) }}</td>
+              <td>V{{ w.vehicle_id }}<br /><span class="muted">≥{{ w.min_power_kw }}kW / {{ w.duration_minutes }}分</span></td>
+              <td>{{ siteName(w.site_id) }}<br /><span class="muted">{{ altText(w) }}</span></td>
+              <td class="mono">{{ fmt(w.arrive_by) }}</td>
+              <td><span :class="['badge', wlBadge(w.status)]">{{ WAITLIST_LABELS[w.status] }}</span></td>
+              <td>
+                <details>
+                  <summary>{{ w.events.length }} 条</summary>
+                  <ul class="timeline">
+                    <li v-for="e in w.events" :key="e.id">
+                      <strong>{{ e.event_type }}</strong>
+                      <pre class="mono" style="white-space:pre-wrap">{{ pretty(e.detail) }}</pre>
+                    </li>
+                  </ul>
+                </details>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+        <p v-else class="muted">暂无候补请求。</p>
+      </div>
+
+      <div class="panel">
+        <h2>⑧ 空档邀请台账与人工保留</h2>
+        <table v-if="invites.length">
+          <thead><tr><th>#</th><th>候补</th><th>站点/枪</th><th>空档</th><th>截止时刻</th><th>状态</th><th>操作</th></tr></thead>
+          <tbody>
+            <tr v-for="i in invites" :key="i.id">
+              <td>{{ i.id }}</td>
+              <td class="mono">{{ wlRef(i.waitlist_request_id) }}</td>
+              <td>{{ siteName(i.site_id) }} · {{ gunCode(i.connector_id) }}（{{ i.offered_power_kw }}kW）</td>
+              <td class="mono">{{ fmt(i.slot_start) }}–{{ fmt(i.slot_end) }}</td>
+              <td class="mono">{{ fmt(i.expires_at) }}</td>
+              <td><span :class="['badge', inviteBadge(i.status)]">{{ INVITE_LABELS[i.status] }}</span></td>
+              <td>
+                <button v-if="i.status === 'PENDING'" class="small ghost" @click="hold(i)">人工保留</button>
+                <span v-else class="muted">已了结</span>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+        <p v-else class="muted">暂无邀请。取消一笔未开始的预约即会触发匹配。</p>
+      </div>
     </section>
   </div>
 </template>
 
 <script setup>
 import { onMounted, reactive, ref, computed } from 'vue'
-import { api, IMPACT_LABELS, MODE_LABELS, newIdempotencyKey, STATUS_LABELS } from '../api.js'
+import {
+  api, IMPACT_LABELS, INVITE_LABELS, MODE_LABELS, newIdempotencyKey,
+  STATUS_LABELS, WAITLIST_LABELS,
+} from '../api.js'
 
 const sites = ref([])
 const reservations = ref([])
 const windows = ref([])
+const waitlist = ref([])
+const invites = ref([])
 const lastImpact = ref(null)
 const notice = ref(null)
 const recoverAt = reactive({})
@@ -210,6 +291,7 @@ const svc = reactive({
   amount: -20,
   note: '',
 })
+const policy = reactive({ site_id: 2, match_policy: 'FIFO' })
 
 const activeWindows = computed(() => windows.value.filter((w) => !w.ended_at))
 
@@ -219,11 +301,62 @@ async function loadAll() {
   sites.value = await api.get('/api/sites')
   reservations.value = await api.get('/api/reservations')
   windows.value = await api.get('/api/maintenance')
+  waitlist.value = await api.get('/api/waitlist')
+  invites.value = await api.get('/api/waitlist/invites')
   for (const w of windows.value) {
     if (!recoverAt[w.id]) recoverAt[w.id] = w.planned_end_at.slice(0, 16)
   }
   if (!svc.reservation_id && reservations.value.length) {
     svc.reservation_id = reservations.value[0].id
+  }
+  onPolicySite()
+}
+
+function onPolicySite() {
+  const s = sites.value.find((x) => x.id === policy.site_id)
+  if (s) policy.match_policy = s.match_policy
+}
+
+async function savePolicy() {
+  notice.value = null
+  try {
+    const r = await api.post(`/api/sites/${policy.site_id}/policy`, {
+      match_policy: policy.match_policy,
+      idempotency_key: newIdempotencyKey(),
+    })
+    notice.value = { kind: 'ok', text: `${r.name} 分配规则已切换为：${r.match_policy}` }
+    await loadAll()
+  } catch (e) {
+    notice.value = { kind: 'bad', text: e.message }
+  }
+}
+
+async function runSweep() {
+  notice.value = null
+  try {
+    const r = await api.post('/api/waitlist/sweep', {
+      site_id: null, idempotency_key: newIdempotencyKey(),
+    })
+    notice.value = {
+      kind: 'info',
+      text: `巡检完成：超时邀请 ${r.expired_invites} 笔，关闭过期候补 ${r.closed_requests} 条`,
+    }
+    await loadAll()
+  } catch (e) {
+    notice.value = { kind: 'bad', text: e.message }
+  }
+}
+
+async function hold(inv) {
+  notice.value = null
+  try {
+    await api.post(`/api/waitlist/invites/${inv.id}/hold`, {
+      note: '运营人工保留', idempotency_key: newIdempotencyKey(),
+    })
+    notice.value = { kind: 'info', text: `邀请 #${inv.id} 已人工保留并失效，候补回到队列` }
+    await loadAll()
+  } catch (e) {
+    notice.value = { kind: 'bad', text: e.message }
   }
 }
 
@@ -303,5 +436,20 @@ function impactBadge(d) {
     UNCHANGED: 'ok', NEEDS_RESELECTION: 'bad',
     MANUAL_CONTACT: 'warn', PROTECTED_CHARGING: 'warn',
   }[d] || 'muted'
+}
+function siteName(id) { const s = sites.value.find((x) => x.id === id); return s ? s.name : '#' + id }
+function altText(w) {
+  try {
+    const ids = JSON.parse(w.acceptable_site_ids || '[]')
+    return ids.length ? '可替代：' + ids.map(siteName).join('、') : '仅首选站'
+  } catch { return '仅首选站' }
+}
+function wlRef(id) { const w = waitlist.value.find((x) => x.id === id); return w ? w.ref : '#' + id }
+function wlBadge(s) {
+  return { QUEUED: 'info', INVITED: 'warn', CONFIRMED: 'ok', DECLINED: 'muted',
+    EXPIRED: 'muted', CANCELLED: 'muted', CLOSED: 'bad' }[s] || 'muted'
+}
+function inviteBadge(s) {
+  return { PENDING: 'warn', ACCEPTED: 'ok', DECLINED: 'muted', EXPIRED: 'bad', SUPERSEDED: 'muted' }[s] || 'muted'
 }
 </script>

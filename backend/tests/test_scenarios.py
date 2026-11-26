@@ -77,7 +77,9 @@ def test_search_does_not_create_order(client):
         "min_power_kw": 90,
     })
     reservations = client.get("/api/reservations").json()
-    assert len(reservations) == 1  # 仍只有种子预约 R-SEEDA01
+    # 东站种子预约仍只有 R-SEEDA01（西站候补演示数据不计入本断言）
+    east = [r for r in reservations if r["site_id"] == SITE]
+    assert len(east) == 1
 
 
 # ---------- 2. 并发：最后一个合格时段只能卖出一次 ----------
@@ -111,7 +113,8 @@ def test_concurrent_connector_mode_one_confirmed_one_rejected(client):
     assert "没有可确认的合格枪口" in fail["detail"]["message"]
 
     listing = client.get("/api/reservations").json()
-    assert len(listing) == 2  # 种子 + 唯一一笔新单
+    east = [r for r in listing if r["site_id"] == SITE]
+    assert len(east) == 2  # 东站种子 + 唯一一笔新单
 
 
 def test_concurrent_pool_mode_one_slot_one_winner(client):
@@ -138,7 +141,8 @@ def test_idempotent_success_replay(client):
     r2 = _confirm(client, V4, "18:00", 10, 90, key="key-idem-aaaa-001")
     assert r2.status_code == 200
     assert r2.json()["ref"] == ref  # 同一笔订单
-    assert len(client.get("/api/reservations").json()) == 2
+    east = [r for r in client.get("/api/reservations").json() if r["site_id"] == SITE]
+    assert len(east) == 2
 
 
 def test_idempotent_failure_replay(client):

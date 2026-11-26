@@ -52,3 +52,26 @@ export const IMPACT_LABELS = {
   MANUAL_CONTACT: '人工联系',
   PROTECTED_CHARGING: '充电中受保护',
 }
+
+export const WAITLIST_LABELS = {
+  QUEUED: '排队中',
+  INVITED: '已发邀请（待响应）',
+  CONFIRMED: '已成交确认',
+  DECLINED: '已拒绝（仍排队）',
+  EXPIRED: '邀请超时（仍排队）',
+  CANCELLED: '已撤销',
+  CLOSED: '已关闭（超到站期限）',
+}
+
+export const INVITE_LABELS = {
+  PENDING: '待响应',
+  ACCEPTED: '已接受并确认',
+  DECLINED: '已拒绝',
+  EXPIRED: '已超时',
+  SUPERSEDED: '已失效（保留/撤销）',
+}
+
+export const POLICY_LABELS = {
+  FIFO: '严格先后（FIFO）',
+  COMPATIBILITY: '兼容优先（稀缺能力优先）',
+}

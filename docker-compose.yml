@@ -19,6 +19,8 @@ services:
     build: ./backend
     environment:
       DATABASE_URL: postgresql+psycopg://ccdev:ccdev@db:5432/ccdev
+      # 候补一次性邀请的有效秒数（演示可改小以便观察超时；默认 120 秒）
+      WAITLIST_INVITE_TTL_SECONDS: "${WAITLIST_INVITE_TTL_SECONDS:-120}"
     depends_on:
       db:
         condition: service_healthy

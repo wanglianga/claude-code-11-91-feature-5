@@ -4,6 +4,7 @@
 # 用法：bash e2e_check.sh
 set -u
 BASE="${BASE:-http://127.0.0.1:8000}"
+PY="${PY:-python3}"
 F="2026-11-27T18"
 pass=0; fail=0
 
@@ -89,6 +90,71 @@ IMP=$(post /api/operations/maintenance "{\"connector_id\":3,\"kind\":\"OUTAGE\",
 check "充电单判定受保护" "PROTECTED_CHARGING" "$(echo "$IMP" | python3 -c "import json,sys;print(next(i['decision'] for i in json.load(sys.stdin)['impacts'] if i['reservation_id']==$CID))")"
 check "充电中取消被拒" "409" "$(code "/api/reservations/$CID/cancel" '{"idempotency_key":"e2e-chg-eeee-5"}')"
 check "订单状态仍是 CHARGING" "CHARGING" "$(curl -s $BASE/api/reservations/$CID | python3 -c 'import json,sys;print(json.load(sys.stdin)["status"])')"
+
+# ========== 候补（waitlist）专项：西站 id=2，枪 E=5(120kW)/F=6(60kW)，预约 id 2/3，候补 Q2=1/Q1=2 ==========
+wl_pending() { curl -s "$BASE/api/waitlist/invites" | python3 -c 'import json,sys;print(json.dumps([i for i in json.load(sys.stdin) if i["status"]=="PENDING"]))'; }
+
+echo "== 9. FIFO：先登记的 Q2(60kW) 拿走高功率 E，Q1(90kW) 在 F 上无合格时段 =="
+$PY -m app.seed >/dev/null
+check "西站当前为 FIFO" "FIFO" "$(curl -s $BASE/api/sites/2 | python3 -c 'import json,sys;print(json.load(sys.stdin)["match_policy"])')"
+post /api/reservations/2/cancel '{"idempotency_key":"e2e-wl-fifo-e-1"}' > /dev/null
+check "FIFO 首个邀请发给 Q2" "1" "$(wl_pending | python3 -c 'import json,sys;d=json.load(sys.stdin);print(len(d)) if d and d[0]["waitlist_request_id"]==1 and d[0]["connector_id"]==5 else print(0)')"
+post /api/reservations/3/cancel '{"idempotency_key":"e2e-wl-fifo-f-2"}' > /dev/null
+check "FIFO 下 Q1 无新邀请（仍只 1 笔待响应）" "1" "$(wl_pending | python3 -c 'import json,sys;print(len(json.load(sys.stdin)))')"
+check "Q1 仍在排队且无邀请" "QUEUED" "$(curl -s $BASE/api/waitlist/2 | python3 -c 'import json,sys;d=json.load(sys.stdin);print(d["status"]) if not d["invites"] else print("HAS_INVITE")')"
+
+echo "== 10. 兼容优先：Q1 用 120kW 的 E、Q2 用 60kW 的 F，两人都能接单 =="
+$PY -m app.seed >/dev/null
+post /api/sites/2/policy '{"match_policy":"COMPATIBILITY","idempotency_key":"e2e-wl-pol-1"}' > /dev/null
+post /api/reservations/2/cancel '{"idempotency_key":"e2e-wl-comp-e-1"}' > /dev/null
+check "兼容优先首个邀请发给严格的 Q1 且锁定 E" "1" "$(wl_pending | python3 -c 'import json,sys;d=json.load(sys.stdin);print(1) if d and d[0]["waitlist_request_id"]==2 and d[0]["connector_id"]==5 else print(0)')"
+post /api/reservations/3/cancel '{"idempotency_key":"e2e-wl-comp-f-2"}' > /dev/null
+check "第二笔邀请发给 Q2 且锁定 F（两人都接单）" "OK" "$(wl_pending | python3 -c '
+import json,sys
+d=json.load(sys.stdin); m={i["waitlist_request_id"]:i["connector_id"] for i in d}
+print("OK") if m.get(2)==5 and m.get(1)==6 else print("NO")')"
+
+echo "== 11. 两名司机并发接受同一空档：只一笔确认 =="
+$PY -m app.seed > /dev/null
+post /api/reservations/2/cancel '{"idempotency_key":"e2e-wl-cc-rel-1"}' > /dev/null
+INV=$(wl_pending | python3 -c 'import json,sys;print(json.load(sys.stdin)[0]["id"])')
+rm -f /tmp/w1.json /tmp/w2.json /tmp/w1.code /tmp/w2.code
+curl -s -o /tmp/w1.json -w '%{http_code}' -X POST "$BASE/api/waitlist/invites/$INV/accept" -H 'Content-Type: application/json' \
+  -d '{"idempotency_key":"e2e-wl-cc-a-1"}' > /tmp/w1.code &
+curl -s -o /tmp/w2.json -w '%{http_code}' -X POST "$BASE/api/waitlist/invites/$INV/accept" -H 'Content-Type: application/json' \
+  -d '{"idempotency_key":"e2e-wl-cc-b-2"}' > /tmp/w2.code &
+wait
+check "并发接受结果码集合" "200,409," "$(sort /tmp/w1.code /tmp/w2.code | tr '\n' ',')"
+check "全局仅一笔候补成交预约" "1" "$(curl -s $BASE/api/reservations | python3 -c 'import json,sys;print(sum(1 for r in json.load(sys.stdin) if "WAITLIST_INVITE" in r["confirmation_snapshot"]))')"
+check "邀请最终为 ACCEPTED" "ACCEPTED" "$(curl -s $BASE/api/waitlist/invites/$INV | python3 -c 'import json,sys;print(json.load(sys.stdin)["status"])')"
+
+echo "== 12. 拒绝留痕 + 人工保留使邀请失效 =="
+$PY -m app.seed > /dev/null
+post /api/reservations/2/cancel '{"idempotency_key":"e2e-wl-dec-rel-1"}' > /dev/null
+INV2=$(wl_pending | python3 -c 'import json,sys;print(json.load(sys.stdin)[0]["id"])')
+check "拒绝邀请" "DECLINED" "$(post /api/waitlist/invites/$INV2/decline '{"reason":"来不了","idempotency_key":"e2e-wl-dec-1"}' | python3 -c 'import json,sys;print(json.load(sys.stdin)["status"])')"
+post /api/reservations/3/cancel '{"idempotency_key":"e2e-wl-hold-rel-2"}' > /dev/null
+INV3=$(wl_pending | python3 -c 'import json,sys;print(json.load(sys.stdin)[0]["id"])')
+check "人工保留后邀请失效" "SUPERSEDED" "$(post /api/waitlist/invites/$INV3/hold '{"note":"站长保留","idempotency_key":"e2e-wl-hold-1"}' | python3 -c 'import json,sys;print(json.load(sys.stdin)["status"])')"
+check "对失效邀请再接受被拒" "409" "$(code /api/waitlist/invites/$INV3/accept '{"idempotency_key":"e2e-wl-hold-acc-2"}')"
+
+echo "== 13. 越过截止的迟到接受：超时落账，不能写成成功（短 TTL 服务器才实跑，否则跳过）=="
+$PY -m app.seed > /dev/null
+post /api/reservations/2/cancel '{"idempotency_key":"e2e-wl-exp-rel-1"}' > /dev/null
+INV4=$(wl_pending | python3 -c 'import json,sys;print(json.load(sys.stdin)[0]["id"])')
+TTL=$(curl -s $BASE/api/waitlist/invites/$INV4 | python3 -c '
+import json,sys,datetime
+i=json.load(sys.stdin)
+ex=datetime.datetime.fromisoformat(i["expires_at"]); cr=datetime.datetime.fromisoformat(i["created_at"])
+print(int((ex-cr).total_seconds()))')
+if [ "$TTL" -le 8 ]; then
+  sleep $((TTL+1))
+  check "巡检把邀请置为 EXPIRED" "EXPIRED" "$(post /api/waitlist/sweep '{"site_id":2,"idempotency_key":"e2e-wl-exp-sweep-1"}' >/dev/null; curl -s $BASE/api/waitlist/invites/$INV4 | python3 -c 'import json,sys;print(json.load(sys.stdin)["status"])')"
+  check "迟到接受被拒（非成功确认）" "409" "$(code /api/waitlist/invites/$INV4/accept '{"idempotency_key":"e2e-wl-exp-acc-2"}')"
+  check "没有任何候补成交预约" "0" "$(curl -s $BASE/api/reservations | python3 -c 'import json,sys;print(sum(1 for r in json.load(sys.stdin) if "WAITLIST_INVITE" in r["confirmation_snapshot"]))')"
+else
+  echo "  ⏭️  当前邀请 TTL=${TTL}s 较长，跳过实时超时（pytest 已用可控时钟覆盖该场景）"
+fi
 
 echo
 echo "通过 $pass 项，失败 $fail 项"

@@ -47,3 +47,40 @@ class ImpactDecision(str, enum.Enum):
     NEEDS_RESELECTION = "NEEDS_RESELECTION"      # 进入改选
     MANUAL_CONTACT = "MANUAL_CONTACT"            # 已到站，人工联系
     PROTECTED_CHARGING = "PROTECTED_CHARGING"    # 充电中，受保护不可释放
+
+
+# ---------- 候补 ----------
+
+class WaitlistStatus(str, enum.Enum):
+    QUEUED = "QUEUED"                    # 排队中，等待空档邀请
+    INVITED = "INVITED"                  # 已收到一次性邀请，等待在截止前响应
+    CONFIRMED = "CONFIRMED"              # 接受邀请并已生成确认预约（终态）
+    DECLINED = "DECLINED"                # 司机拒绝邀请，回到队尾继续候补
+    EXPIRED = "EXPIRED"                  # 邀请超时未响应，回到队尾继续候补
+    CANCELLED = "CANCELLED"              # 司机撤销候补（终态）
+    CLOSED = "CLOSED"                    # 超过到站期限仍未成交，系统关闭（终态）
+
+
+# 仍处于候补队列、可继续接收邀请的状态
+WAITLIST_OPEN_STATUSES = (WaitlistStatus.QUEUED, WaitlistStatus.DECLINED, WaitlistStatus.EXPIRED)
+# 候补生命周期终态
+WAITLIST_TERMINAL_STATUSES = (
+    WaitlistStatus.CONFIRMED,
+    WaitlistStatus.CANCELLED,
+    WaitlistStatus.CLOSED,
+)
+
+
+class InviteStatus(str, enum.Enum):
+    PENDING = "PENDING"        # 待响应（在截止时刻之前）
+    ACCEPTED = "ACCEPTED"      # 已接受并确认（一次性，全局唯一一笔）
+    DECLINED = "DECLINED"      # 司机明确拒绝
+    EXPIRED = "EXPIRED"        # 超过截止时刻未响应
+    SUPERSEDED = "SUPERSEDED"  # 人工保留/撤销等运营动作使其失效
+
+
+class MatchPolicy(str, enum.Enum):
+    # 严格按加入时间（同站点同策略域内 created_at, id 升序），公平易解释
+    FIFO = "FIFO"
+    # 兼容优先：先安排只有少数枪口能满足的“严格”请求，再按排队时间处理同等候选
+    COMPATIBILITY = "COMPATIBILITY"

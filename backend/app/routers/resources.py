@@ -19,6 +19,15 @@ def list_sites(db: Session = Depends(get_db)):
     return db.scalars(select(Site).order_by(Site.id)).all()
 
 
+@router.get("/sites/{site_id}", response_model=SiteOut)
+def get_site(site_id: int, db: Session = Depends(get_db)):
+    from fastapi import HTTPException
+    site = db.get(Site, site_id)
+    if site is None:
+        raise HTTPException(404, "站点不存在")
+    return site
+
+
 @router.get("/connectors/{connector_id}/maintenance", response_model=list[MaintenanceOut])
 def connector_maintenance(connector_id: int, db: Session = Depends(get_db)):
     return db.scalars(

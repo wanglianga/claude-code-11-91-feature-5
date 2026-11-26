@@ -195,6 +195,9 @@ def _transition(db: Session, reservation_id: int, action: str, build) -> Reserva
 
 
 def cancel(db: Session, reservation_id: int) -> Reservation:
+    # 延迟导入：waitlist 服务复用本模块的锁常量与事件/编号工具，避免循环依赖
+    from .waitlist import dispatch_for_cancellation
+
     def build(r: Reservation) -> None:
         r.status = ReservationStatus.CANCELLED
         # 取消即释放：connector_id 保留用于审计，但容量引擎只统计 HOLDING 状态
@@ -202,15 +205,30 @@ def cancel(db: Session, reservation_id: int) -> Reservation:
             "released_connector_id": r.connector_id,
             "note": "容量已释放，可被新预约使用",
         })
+        # 只把“未开始”的释放时段交给候补队列，生成带截止时刻的一次性邀请
+        invites = dispatch_for_cancellation(db, r)
+        _add_event(db, r, "WAITLIST_DISPATCH", {
+            "invites_issued": len(invites),
+            "invite_ids": [i.id for i in invites],
+            "note": "候补邀请不等于预约，须司机在截止前接受才会确认",
+        })
     return _transition(db, reservation_id, "cancel", build)
 
 
 def mark_no_show(db: Session, reservation_id: int) -> Reservation:
+    from .waitlist import dispatch_for_cancellation
+
     def build(r: Reservation) -> None:
         if datetime.now() < r.start_at:
             raise HTTPException(409, "预约开始时间未到，不能标记迟到；如需放弃请取消")
         r.status = ReservationStatus.NO_SHOW
         _add_event(db, r, "NO_SHOW", {"released_connector_id": r.connector_id})
+        # 失约同样释放未开始时段，交给候补队列
+        invites = dispatch_for_cancellation(db, r)
+        _add_event(db, r, "WAITLIST_DISPATCH", {
+            "invites_issued": len(invites),
+            "invite_ids": [i.id for i in invites],
+        })
     return _transition(db, reservation_id, "no_show", build)
 
 

@@ -6,10 +6,13 @@ from pydantic import BaseModel, ConfigDict, Field, PlainSerializer
 
 from .enums import (
     ImpactDecision,
+    InviteStatus,
     MaintenanceKind,
+    MatchPolicy,
     ReservationMode,
     ReservationStatus,
     ServiceActionKind,
+    WaitlistStatus,
 )
 
 # 数据库用 Numeric 保证精度，API 统一以 JSON number 输出
@@ -46,6 +49,7 @@ class SiteOut(ORMModel):
     id: int
     name: str
     location: str
+    match_policy: MatchPolicy
     connectors: list[ConnectorOut]
 
 
@@ -199,3 +203,85 @@ class ServiceActionCreate(BaseModel):
     amount: float | None = None
     note: str = ""
     idempotency_key: str = Field(min_length=8, max_length=64)
+
+
+# ---------- 候补 ----------
+
+class WaitlistCreate(BaseModel):
+    vehicle_id: int
+    site_id: int
+    min_power_kw: float = Field(gt=0)
+    duration_minutes: int = Field(gt=0, le=600)
+    arrive_by: datetime
+    # 可接受替代站点（不含登记站点本身；为空表示只接受登记站点）
+    acceptable_site_ids: list[int] = []
+    idempotency_key: str = Field(min_length=8, max_length=64)
+
+
+class WaitlistEventOut(ORMModel):
+    id: int
+    event_type: str
+    detail: str
+    created_at: datetime
+
+
+class WaitlistInviteOut(ORMModel):
+    id: int
+    waitlist_request_id: int
+    site_id: int
+    status: InviteStatus
+    connector_id: int
+    slot_start: datetime
+    slot_end: datetime
+    offered_power_kw: DecimalNum
+    expires_at: datetime
+    source_reservation_id: int | None
+    responded_at: datetime | None
+    created_at: datetime
+
+
+class WaitlistOut(ORMModel):
+    id: int
+    ref: str
+    vehicle_id: int
+    site_id: int
+    status: WaitlistStatus
+    min_power_kw: DecimalNum
+    duration_minutes: int
+    arrive_by: datetime
+    acceptable_site_ids: str
+    reservation_id: int | None
+    created_at: datetime
+    invites: list[WaitlistInviteOut] = []
+    events: list[WaitlistEventOut] = []
+
+
+class WaitlistInviteDecision(BaseModel):
+    reason: str = ""
+    idempotency_key: str = Field(min_length=8, max_length=64)
+
+
+class WaitlistCancel(BaseModel):
+    idempotency_key: str = Field(min_length=8, max_length=64)
+
+
+class ManualHoldRequest(BaseModel):
+    note: str = ""
+    idempotency_key: str = Field(min_length=8, max_length=64)
+
+
+class SitePolicyUpdate(BaseModel):
+    match_policy: MatchPolicy
+    idempotency_key: str = Field(min_length=8, max_length=64)
+
+
+class SweepRequest(BaseModel):
+    # 为空时巡检全部站点
+    site_id: int | None = None
+    idempotency_key: str = Field(min_length=8, max_length=64)
+
+
+class SitePolicyOut(ORMModel):
+    id: int
+    name: str
+    match_policy: MatchPolicy
